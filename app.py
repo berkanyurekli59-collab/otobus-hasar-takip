@@ -2,135 +2,151 @@ import streamlit as st
 import cv2
 import numpy as np
 import os
-import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime
 from fpdf import FPDF
 
-# Sayfa Ayarları
-st.set_page_config(page_title="Tekulaş Profesyonel Denetim", layout="wide")
+# --- KLASÖR AYARLARI ---
+# Streamlit Cloud üzerinde klasörlerin var olduğundan emin olalım
+dirs = ["raporlar", "video_arsivi", "temp"]
+for d in dirs:
+    if not os.path.exists(d):
+        os.makedirs(d)
 
-# Klasör ve Dosya Kontrolleri
-if not os.path.exists("data"): os.makedirs("data")
-DB_FILE = "data/denetim_gecmisi.csv"
+# --- GÖRÜNTÜ İŞLEME FONKSİYONLARI ---
 
-# --- YAN MENÜ (ARŞİV VE İSTATİSTİK) ---
-st.sidebar.title("📊 Filo Yönetim Paneli")
+def goruntu_normallestir(frame):
+    """Işık farklarını gidermek için Histogram Eşitleme (CLAHE) uygular."""
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    cl = clahe.apply(l)
+    limg = cv2.merge((cl, a, b))
+    return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
-if os.path.exists(DB_FILE):
-    df = pd.read_csv(DB_FILE)
-    st.sidebar.metric("Toplam Denetim", len(df))
-    st.sidebar.subheader("Hızlı Sorgulama")
-    plaka_sorgu = st.sidebar.selectbox("Araç Geçmişi:", ["Seçiniz..."] + sorted(df['Plaka'].unique().tolist()))
-    
-    if plaka_sorgu != "Seçiniz...":
-        araç_df = df[df['Plaka'] == plaka_sorgu].sort_values(by='Tarih', ascending=False)
-        st.sidebar.write(araç_df[['Tarih', 'Denetçi', 'Genel_Durum']].head(5))
-
-# --- FONKSİYONLAR ---
-def rapor_olustur(plaka, tarih, denetci, sonuclar):
+def rapor_olustur(plaka, skor, hasar_tipi, frame_path):
+    """PDF Raporu oluşturur ve kaydeder."""
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", 'B', 16)
-    pdf.cell(0, 10, txt=f"PROFESYONEL HASAR RAPORU - {plaka}", ln=True, align='C')
-    pdf.set_font("Arial", size=12)
-    pdf.cell(0, 10, txt=f"Tarih: {tarih} | Denetçi: {denetci}", ln=True)
+    pdf.cell(0, 10, txt="OTOBUS HASAR ANALIZ RAPORU", ln=True, align='C')
     pdf.ln(10)
     
-    for aci, veri in sonuclar.items():
-        pdf.set_font("Arial", 'B', 12)
-        pdf.cell(0, 10, txt=f"Bölge: {aci} | Tespit: {veri['durum']}", ln=True)
-        pdf.set_font("Arial", size=10)
-        pdf.cell(0, 10, txt=f"Not: {veri['not']}", ln=True)
-        if veri['resim_yolu']:
-            pdf.image(veri['resim_yolu'], w=90)
-            pdf.ln(5)
+    pdf.set_font("Arial", size=12)
+    pdf.cell(0, 10, txt=f"Arac Plakasi: {plaka}", ln=True)
+    pdf.cell(0, 10, txt=f"Tarih: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True)
+    pdf.cell(0, 10, txt=f"Hasar Skoru: {skor}", ln=True)
+    pdf.cell(0, 10, txt=f"Tespit: {hasar_tipi}", ln=True)
     
-    rapor_adi = f"Rapor_{plaka}_{tarih}.pdf"
+    if frame_path and os.path.exists(frame_path):
+        pdf.ln(10)
+        pdf.image(frame_path, x=10, w=180)
+    
+    rapor_adi = f"raporlar/{plaka}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf"
     pdf.output(rapor_adi)
     return rapor_adi
 
-def analiz_et(eski_yol, yeni_img, aci, plaka):
-    if not os.path.exists(eski_yol):
-        return "İlk Kayıt", None, 0
-    img_eski = cv2.imread(eski_yol)
-    img_yeni = cv2.resize(yeni_img, (img_eski.shape[1], img_eski.shape[0]))
-    g1 = cv2.cvtColor(img_eski, cv2.COLOR_BGR2GRAY)
-    g2 = cv2.cvtColor(img_yeni, cv2.COLOR_BGR2GRAY)
-    fark = cv2.absdiff(cv2.GaussianBlur(g1, (5,5), 0), cv2.GaussianBlur(g2, (5,5), 0))
-    _, esik = cv2.threshold(fark, 35, 255, cv2.THRESH_BINARY)
-    konturlar, _ = cv2.findContours(esik, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    hasar_vurgulu = img_yeni.copy()
-    sayi = sum(1 for c in konturlar if cv2.contourArea(c) > 600)
+def kiyaslamali_analiz(eski_video_yolu, yeni_video_yolu, esik=15000):
+    """İki video arasındaki farkı bulur."""
+    cap_old = cv2.VideoCapture(eski_video_yolu)
+    cap_new = cv2.VideoCapture(yeni_video_yolu)
     
-    if sayi > 0:
-        resim_yolu = f"data/temp_{aci}_{plaka}.jpg"
-        for c in konturlar:
-            if cv2.contourArea(c) > 600:
-                (x, y, w, h) = cv2.boundingRect(c)
-                cv2.rectangle(hasar_vurgulu, (x, y), (x + w, y + h), (0, 0, 255), 3)
-        cv2.imwrite(resim_yolu, hasar_vurgulu)
-        return f"Değişim ({sayi} nokta)", resim_yolu, sayi
-    return "Temiz", None, 0
+    max_fark = 0
+    en_iyi_kare = None
+    maske_kare = None
 
-# --- ANA EKRAN ---
-st.title("🚌 Tekulaş Akıllı Denetim Sistemi")
+    while True:
+        ret1, frame_old = cap_old.read()
+        ret2, frame_new = cap_new.read()
+        if not ret1 or not ret2: break
 
-with st.expander("📝 Denetim Bilgileri", expanded=True):
-    c1, c2 = st.columns(2)
-    plaka = c1.text_input("ARAÇ PLAKASI:", placeholder="59 ...").upper().strip()
-    denetci = c2.text_input("DENETÇİ / ŞOFÖR ADI:", placeholder="Ad Soyad")
+        # Normalizasyon
+        n_old = goruntu_normallestir(frame_old)
+        n_new = goruntu_normallestir(frame_new)
 
-if plaka and denetci:
-    st.divider()
-    acilar = ["Ön", "Arka", "Sağ Yan", "Sol Yan"]
-    veriler = {}
+        # Fark Analizi
+        diff = cv2.absdiff(cv2.cvtColor(n_old, cv2.COLOR_BGR2GRAY), 
+                           cv2.cvtColor(n_new, cv2.COLOR_BGR2GRAY))
+        _, mask = cv2.threshold(diff, 40, 255, cv2.THRESH_BINARY)
+        skor = np.sum(mask == 255)
+
+        if skor > max_fark:
+            max_fark = skor
+            en_iyi_kare = frame_new
+            maske_kare = mask
+
+    cap_old.release()
+    cap_new.release()
     
-    cols = st.columns(2)
-    for i, aci in enumerate(acilar):
-        with cols[i % 2]:
-            st.subheader(f"📍 {aci}")
-            img_file = st.file_uploader(f"{aci} Çek/Yükle", type=['jpg','png','jpeg'], key=f"img_{aci}")
-            notu = st.text_input(f"{aci} İçin Not (Opsiyonel):", key=f"not_{aci}")
-            seviye = st.select_slider(f"{aci} Hasar Seviyesi:", options=["Yok", "Düşük", "Orta", "Yüksek"], key=f"sev_{aci}")
-            veriler[aci] = {"dosya": img_file, "not": notu, "seviye": seviye}
+    if max_fark > esik:
+        return True, max_fark, en_iyi_kare, maske_kare
+    return False, max_fark, None, None
 
-    if st.button("🚀 DENETİMİ KAYDET VE ANALİZ ET"):
-        if all(v["dosya"] for v in veriler.values()):
-            bugun = datetime.now().strftime("%Y-%m-%d")
-            dun = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-            rapor_detay = {}
-            toplam_hasar_skoru = 0
-            
-            with st.spinner("Yapay zeka hasar taraması yapıyor..."):
-                for aci, icerik in veriler.items():
-                    file_bytes = np.asarray(bytearray(icerik["dosya"].read()), dtype=np.uint8)
-                    img = cv2.imdecode(file_bytes, 1)
-                    
-                    yeni_yol = f"data/{plaka}_{aci}_{bugun}.jpg"
-                    cv2.imwrite(yeni_yol, img)
-                    
-                    eski_yol = f"data/{plaka}_{aci}_{dun}.jpg"
-                    durum, resim, skor = analiz_et(eski_yol, img, aci, plaka)
-                    toplam_hasar_skoru += skor
-                    rapor_detay[aci] = {"durum": durum, "resim_yolu": resim, "not": icerik["not"]}
-            
-            # Excel/CSV Kaydı
-            yeni_kayit = {
-                "Tarih": bugun, "Plaka": plaka, "Denetçi": denetci, 
-                "Hasar_Noktasi": toplam_hasar_skoru, 
-                "Genel_Durum": "Hasarlı" if toplam_hasar_skoru > 0 else "Temiz"
-            }
-            df_yeni = pd.DataFrame([yeni_kayit])
-            if os.path.exists(DB_FILE):
-                df_old = pd.read_csv(DB_FILE)
-                pd.concat([df_old, df_yeni]).to_csv(DB_FILE, index=False)
-            else:
-                df_yeni.to_csv(DB_FILE, index=False)
-            
-            # Rapor Sunumu
-            pdf_yolu = rapor_olustur(plaka, bugun, denetci, rapor_detay)
-            st.success(f"✅ İşlem Başarılı! Toplam {toplam_hasar_skoru} değişim noktası bulundu.")
-            with open(pdf_yolu, "rb") as f:
-                st.download_button("📥 Profesyonel PDF Raporu İndir", f, file_name=pdf_yolu)
-        else:
-            st.error("Lütfen 4 açının da fotoğrafını yükleyiniz.")
+# --- STREAMLIT ARAYÜZÜ ---
+
+st.set_page_config(page_title="Otobüs Hasar Takip", layout="wide")
+
+# Sol Panel: Arşiv ve Plaka Girişi
+st.sidebar.title("🚌 Araç Yönetimi")
+yeni_plaka = st.sidebar.text_input("Yeni Plaka Kaydet/Seç:", "").upper()
+
+# Mevcut plakaları listele
+kayitli_videolar = [f.replace("_kayit.mp4", "") for f in os.listdir("video_arsivi") if f.endswith(".mp4")]
+secilen_plaka = st.sidebar.selectbox("Kayıtlı Plakalar:", [""] + kayitli_videolar)
+
+aktif_plaka = yeni_plaka if yeni_plaka else secilen_plaka
+
+# Arama ve Arşiv Listesi
+st.sidebar.markdown("---")
+st.sidebar.subheader("🗄️ Rapor Arşivi")
+arama = st.sidebar.text_input("Raporlarda Ara:")
+raporlar = sorted([f for f in os.listdir("raporlar") if f.endswith(".pdf")], reverse=True)
+
+for r in raporlar:
+    if arama.upper() in r.upper():
+        with st.sidebar.expander(f"📄 {r.split('_')[0]}"):
+            with open(f"raporlar/{r}", "rb") as f:
+                st.download_button("İndir", f, file_name=r, key=r)
+
+# Ana Ekran
+st.title(f"📊 Hasar Analiz Paneli: {aktif_plaka if aktif_plaka else 'Araç Seçiniz'}")
+
+if aktif_plaka:
+    uploaded_video = st.file_uploader("Kontrol Videosunu Yükle", type=["mp4", "mov"])
+    
+    if uploaded_video:
+        temp_yolu = f"temp/{aktif_plaka}_temp.mp4"
+        with open(temp_yolu, "wb") as f:
+            f.write(uploaded_video.getbuffer())
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("💾 Referans Olarak Kaydet"):
+                os.rename(temp_yolu, f"video_arsivi/{aktif_plaka}_kayit.mp4")
+                st.success("Video referans (temiz hal) olarak kaydedildi.")
+        
+        with col2:
+            if st.button("🔍 Dün ile Kıyasla"):
+                eski_yol = f"video_arsivi/{aktif_plaka}_kayit.mp4"
+                if os.path.exists(eski_yol):
+                    with st.spinner("Analiz ediliyor..."):
+                        hasar_var, skor, kare, maske = kiyaslamali_analiz(eski_yol, temp_yolu)
+                        
+                        if hasar_var:
+                            st.error(f"⚠️ YENİ HASAR! Skor: {skor}")
+                            img_path = f"temp/{aktif_plaka}_hasar.jpg"
+                            cv2.imwrite(img_path, kare)
+                            
+                            c1, c2 = st.columns(2)
+                            c1.image(kare, caption="Tespit Edilen Kare")
+                            c2.image(maske, caption="Hasar Haritası (Beyaz Alanlar)")
+                            
+                            pdf_yolu = rapor_olustur(aktif_plaka, skor, "Yeni Hasar", img_path)
+                            with open(pdf_yolu, "rb") as f:
+                                st.download_button("📥 Analiz Raporunu İndir", f, file_name=pdf_yolu)
+                        else:
+                            st.success("✅ Yeni hasar bulunamadı.")
+                else:
+                    st.warning("Bu aracın geçmiş kaydı yok. Önce 'Referans Olarak Kaydet' butonuna basmalısınız.")
+else:
+    st.info("Lütfen sol taraftan bir plaka girin veya seçin.")
