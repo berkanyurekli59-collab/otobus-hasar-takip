@@ -2,20 +2,18 @@ import streamlit as st
 import cv2
 import numpy as np
 import os
+import shutil  # Daha güvenli dosya kopyalama için eklendi
 from datetime import datetime
 from fpdf import FPDF
 
 # --- KLASÖR AYARLARI ---
-# Streamlit Cloud üzerinde klasörlerin var olduğundan emin olalım
 dirs = ["raporlar", "video_arsivi", "temp"]
 for d in dirs:
     if not os.path.exists(d):
         os.makedirs(d)
 
 # --- GÖRÜNTÜ İŞLEME FONKSİYONLARI ---
-
 def goruntu_normallestir(frame):
-    """Işık farklarını gidermek için Histogram Eşitleme (CLAHE) uygular."""
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -24,13 +22,11 @@ def goruntu_normallestir(frame):
     return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
 
 def rapor_olustur(plaka, skor, hasar_tipi, frame_path):
-    """PDF Raporu oluşturur ve kaydeder."""
     pdf = FPDF()
     pdf.add_page()
     pdf.set_font("Arial", 'B', 16)
     pdf.cell(0, 10, txt="OTOBUS HASAR ANALIZ RAPORU", ln=True, align='C')
     pdf.ln(10)
-    
     pdf.set_font("Arial", size=12)
     pdf.cell(0, 10, txt=f"Arac Plakasi: {plaka}", ln=True)
     pdf.cell(0, 10, txt=f"Tarih: {datetime.now().strftime('%d/%m/%Y %H:%M')}", ln=True)
@@ -46,7 +42,6 @@ def rapor_olustur(plaka, skor, hasar_tipi, frame_path):
     return rapor_adi
 
 def kiyaslamali_analiz(eski_video_yolu, yeni_video_yolu, esik=15000):
-    """İki video arasındaki farkı bulur."""
     cap_old = cv2.VideoCapture(eski_video_yolu)
     cap_new = cv2.VideoCapture(yeni_video_yolu)
     
@@ -59,11 +54,9 @@ def kiyaslamali_analiz(eski_video_yolu, yeni_video_yolu, esik=15000):
         ret2, frame_new = cap_new.read()
         if not ret1 or not ret2: break
 
-        # Normalizasyon
         n_old = goruntu_normallestir(frame_old)
         n_new = goruntu_normallestir(frame_new)
 
-        # Fark Analizi
         diff = cv2.absdiff(cv2.cvtColor(n_old, cv2.COLOR_BGR2GRAY), 
                            cv2.cvtColor(n_new, cv2.COLOR_BGR2GRAY))
         _, mask = cv2.threshold(diff, 40, 255, cv2.THRESH_BINARY)
@@ -82,20 +75,14 @@ def kiyaslamali_analiz(eski_video_yolu, yeni_video_yolu, esik=15000):
     return False, max_fark, None, None
 
 # --- STREAMLIT ARAYÜZÜ ---
-
 st.set_page_config(page_title="Otobüs Hasar Takip", layout="wide")
 
-# Sol Panel: Arşiv ve Plaka Girişi
 st.sidebar.title("🚌 Araç Yönetimi")
 yeni_plaka = st.sidebar.text_input("Yeni Plaka Kaydet/Seç:", "").upper()
-
-# Mevcut plakaları listele
 kayitli_videolar = [f.replace("_kayit.mp4", "") for f in os.listdir("video_arsivi") if f.endswith(".mp4")]
 secilen_plaka = st.sidebar.selectbox("Kayıtlı Plakalar:", [""] + kayitli_videolar)
-
 aktif_plaka = yeni_plaka if yeni_plaka else secilen_plaka
 
-# Arama ve Arşiv Listesi
 st.sidebar.markdown("---")
 st.sidebar.subheader("🗄️ Rapor Arşivi")
 arama = st.sidebar.text_input("Raporlarda Ara:")
@@ -105,48 +92,51 @@ for r in raporlar:
     if arama.upper() in r.upper():
         with st.sidebar.expander(f"📄 {r.split('_')[0]}"):
             with open(f"raporlar/{r}", "rb") as f:
-                st.download_button("İndir", f, file_name=r, key=r)
+                st.download_button("İndir", f, file_name=r, key=f"dl_{r}")
 
-# Ana Ekran
 st.title(f"📊 Hasar Analiz Paneli: {aktif_plaka if aktif_plaka else 'Araç Seçiniz'}")
 
 if aktif_plaka:
     uploaded_video = st.file_uploader("Kontrol Videosunu Yükle", type=["mp4", "mov"])
     
     if uploaded_video:
-        temp_yolu = f"temp/{aktif_plaka}_temp.mp4"
+        # Geçici dosyayı kaydet
+        temp_yolu = os.path.join("temp", f"{aktif_plaka}_temp.mp4")
         with open(temp_yolu, "wb") as f:
             f.write(uploaded_video.getbuffer())
+        
+        st.video(temp_yolu) # Videoyu ekranda göster (Yüklendiğini teyit et)
         
         col1, col2 = st.columns(2)
         
         with col1:
             if st.button("💾 Referans Olarak Kaydet"):
-                os.rename(temp_yolu, f"video_arsivi/{aktif_plaka}_kayit.mp4")
-                st.success("Video referans (temiz hal) olarak kaydedildi.")
+                hedef_yol = os.path.join("video_arsivi", f"{aktif_plaka}_kayit.mp4")
+                shutil.copy(temp_yolu, hedef_yol) # Rename yerine Copy daha güvenlidir
+                st.success(f"✅ {aktif_plaka} plakalı araç için referans video başarıyla kaydedildi.")
         
         with col2:
-            if st.button("🔍 Dün ile Kıyasla"):
-                eski_yol = f"video_arsivi/{aktif_plaka}_kayit.mp4"
+            if st.button("🔍 Hasar Analizi Yap"):
+                eski_yol = os.path.join("video_arsivi", f"{aktif_plaka}_kayit.mp4")
                 if os.path.exists(eski_yol):
-                    with st.spinner("Analiz ediliyor..."):
+                    with st.spinner("İki video karşılaştırılıyor, lütfen bekleyin..."):
                         hasar_var, skor, kare, maske = kiyaslamali_analiz(eski_yol, temp_yolu)
                         
                         if hasar_var:
-                            st.error(f"⚠️ YENİ HASAR! Skor: {skor}")
+                            st.error(f"⚠️ Yeni Hasar Tespit Edildi! (Fark Skoru: {skor})")
                             img_path = f"temp/{aktif_plaka}_hasar.jpg"
                             cv2.imwrite(img_path, kare)
                             
                             c1, c2 = st.columns(2)
-                            c1.image(kare, caption="Tespit Edilen Kare")
-                            c2.image(maske, caption="Hasar Haritası (Beyaz Alanlar)")
+                            c1.image(kare, caption="Tespit Edilen Hasarlı Bölge", use_column_width=True)
+                            c2.image(maske, caption="Hasar Maskesi (Piksel Farkı)", use_column_width=True)
                             
                             pdf_yolu = rapor_olustur(aktif_plaka, skor, "Yeni Hasar", img_path)
                             with open(pdf_yolu, "rb") as f:
-                                st.download_button("📥 Analiz Raporunu İndir", f, file_name=pdf_yolu)
+                                st.download_button("📥 PDF Raporunu İndir", f, file_name=os.path.basename(pdf_yolu))
                         else:
-                            st.success("✅ Yeni hasar bulunamadı.")
+                            st.success("✅ Karşılaştırma Tamamlandı: İki video arasında anlamlı bir fark bulunamadı.")
                 else:
-                    st.warning("Bu aracın geçmiş kaydı yok. Önce 'Referans Olarak Kaydet' butonuna basmalısınız.")
+                    st.warning("⚠️ Bu aracın geçmiş (temiz) kaydı bulunamadı. Lütfen önce 'Referans Olarak Kaydet' butonuna basın.")
 else:
-    st.info("Lütfen sol taraftan bir plaka girin veya seçin.")
+    st.info("İşleme başlamak için sol panelden plaka girişi yapın.")
